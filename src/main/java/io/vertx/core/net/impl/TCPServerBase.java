@@ -64,7 +64,8 @@ public abstract class TCPServerBase implements Closeable, MetricsProvider {
 
   // Main
   private SSLHelper sslHelper;
-  private volatile Future<SslContextUpdate> sslChannelProvider;
+  private volatile SslChannelProvider sslChannelProvider;
+  private Future<SslContextUpdate> sslUpdateInProgress;
   private volatile GlobalTrafficShapingHandler trafficShapingHandler;
   private ServerChannelLoadBalancer channelBalancer;
   private Future<Channel> bindFuture;
@@ -78,9 +79,10 @@ public abstract class TCPServerBase implements Closeable, MetricsProvider {
   }
 
   public SslContextProvider sslContextProvider() {
-    SslContextUpdate update = sslChannelProvider.result();
-    if (update != null) {
-      return update.sslChannelProvider().sslContextProvider();
+    TCPServerBase server = actualServer;
+    SslChannelProvider provider = server != null ? server.sslChannelProvider : sslChannelProvider;
+    if (provider != null) {
+      return provider.sslContextProvider();
     } else {
       return null;
     }
@@ -130,8 +132,7 @@ public abstract class TCPServerBase implements Closeable, MetricsProvider {
       return server.updateSSLOptions(options, force);
     } else {
       ContextInternal ctx = vertx.getOrCreateContext();
-      Future<SslContextUpdate> update = sslHelper.updateSslContext(new SSLOptions(options), force, ctx);
-      sslChannelProvider = update;
+      Future<SslContextUpdate> update = updateSslContext(new SSLOptions(options), force, ctx);
       return update.transform(ar -> {
         if (ar.failed()) {
           return ctx.failedFuture(ar.cause());
@@ -142,6 +143,27 @@ public abstract class TCPServerBase implements Closeable, MetricsProvider {
         }
       });
     }
+  }
+
+  private synchronized Future<SslContextUpdate> updateSslContext(SSLOptions options, boolean force, ContextInternal ctx) {
+    SSLHelper helper = sslHelper;
+    // 1. 等待前一次配置发布完成后再开始更新。
+    Future<SslContextUpdate> update;
+    if (sslUpdateInProgress == null) {
+      update = helper.updateSslContext(options, force, ctx);
+    } else {
+      update = sslUpdateInProgress.transform(ar -> helper.updateSslContext(options, force, ctx));
+    }
+    // 2. 只向当前监听周期发布完成的配置。
+    sslUpdateInProgress = update.map(result -> {
+      synchronized (TCPServerBase.this) {
+        if (sslHelper == helper) {
+          sslChannelProvider = result.sslChannelProvider();
+        }
+      }
+      return result;
+    });
+    return sslUpdateInProgress;
   }
 
   public void updateTrafficShapingOptions(TrafficShapingOptions options) {
@@ -226,9 +248,11 @@ public abstract class TCPServerBase implements Closeable, MetricsProvider {
         actualServer = this;
         bindFuture = promise;
         sslHelper = createSSLHelper();
+        sslChannelProvider = null;
+        sslUpdateInProgress = null;
         trafficShapingHandler = createTrafficShapingHandler();
         childHandler =  childHandler(listenContext, localAddress, trafficShapingHandler);
-        worker = ch -> childHandler.accept(ch, sslChannelProvider.result().sslChannelProvider());
+        worker = ch -> childHandler.accept(ch, sslChannelProvider);
         channelBalancer = new ServerChannelLoadBalancer(vertx.getAcceptorEventLoopGroup().next());
 
         // Register the server in the shared server list
@@ -239,7 +263,7 @@ public abstract class TCPServerBase implements Closeable, MetricsProvider {
         listenContext.addCloseHook(this);
 
         // Initialize SSL before binding
-        sslChannelProvider = sslHelper.updateSslContext(options.getSslOptions(), true, listenContext).onComplete(ar -> {
+        updateSslContext(options.getSslOptions(), true, listenContext).onComplete(ar -> {
           if (ar.succeeded()) {
             // Socket bind
             channelBalancer.addWorker(eventLoop, worker);
@@ -296,7 +320,7 @@ public abstract class TCPServerBase implements Closeable, MetricsProvider {
         // Ensure the workers inherit the actual server's traffic-shaping handler
         trafficShapingHandler = actualServer.trafficShapingHandler;
         childHandler =  childHandler(listenContext, localAddress, actualServer.trafficShapingHandler);
-        worker = ch -> childHandler.accept(ch, actualServer.sslChannelProvider.result().sslChannelProvider());
+        worker = ch -> childHandler.accept(ch, actualServer.sslChannelProvider);
         actualServer.channelBalancer.addWorker(eventLoop, worker);
         listenContext.addCloseHook(this);
         main.bindFuture.onComplete(promise);
